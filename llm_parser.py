@@ -23,9 +23,10 @@ logger = logging.getLogger(__name__)
 # =============================================
 # 경로 설정
 # =============================================
-BASE_DIR    = Path(__file__).parent
-OUTPUT_DIR  = BASE_DIR / "data" / "output"
-FINAL_FILE  = BASE_DIR / "data" / "output.json"
+BASE_DIR        = Path(__file__).parent
+OUTPUT_DIR      = BASE_DIR / "data" / "output"
+FINAL_FILE      = BASE_DIR / "data" / "output.json"
+CATEGORIES_FILE = BASE_DIR / "categories.json"
 
 # =============================================
 # Gemini API 초기화
@@ -38,6 +39,62 @@ _GENERATE_CONFIG = types.GenerateContentConfig(
     response_mime_type="application/json",
     temperature=0.1,
 )
+
+
+# =============================================
+# 카테고리 로드
+# =============================================
+
+def load_categories(path: Path = CATEGORIES_FILE) -> list[dict]:
+    """categories.json 에서 카테고리 목록을 로드한다.
+
+    파일이 없으면 기본 카테고리('기타')만 포함한 목록을 반환한다.
+    """
+    if not path.exists():
+        logger.warning(
+            "categories.json 을 찾을 수 없습니다 (%s). 기본 카테고리만 사용합니다.",
+            path,
+        )
+        return [{"name": "기타", "description": "분류 미정"}]
+    categories = json.loads(path.read_text(encoding="utf-8"))
+    logger.info("카테고리 %d개 로드: %s", len(categories), [c["name"] for c in categories])
+    return categories
+
+
+def _build_system_prompt(categories: list[dict]) -> str:
+    """카테고리 목록을 바탕으로 Gemini 시스템 프롬프트를 생성한다."""
+    category_lines = "\n".join(
+        f"- {cat['name']:<14}: {cat['description']}"
+        for cat in categories
+    )
+    return f"""\
+당신은 대학 교무지원과의 행정 문서 분석 전문가입니다.
+아래 문서 텍스트를 읽고, 다음 JSON 스키마에 정확히 맞춰 정보를 추출하세요.
+
+### 출력 JSON 스키마
+{{
+  "category":       "아래 카테고리 목록 중 하나를 선택 (반드시 목록에서만 선택)",
+  "task_name":      "업무명 (문서 제목 기반, 없으면 빈 문자열)",
+  "description":    "업무 개요 (2~4문장으로 요약)",
+  "precautions":    ["주의사항 1", "주의사항 2", "..."],
+  "timeline":       [
+    {{"date": "날짜 또는 기간 (예: 2025-03-01)", "action": "해야 할 일"}}
+  ],
+  "related_depts":  ["협조 부서 또는 기관 1", "협조 부서 또는 기관 2", "..."],
+  "deliverables":   ["산출물 또는 제출 서류 1", "산출물 또는 제출 서류 2", "..."]
+}}
+
+### 카테고리 목록 (category 필드에 아래 중 하나를 정확히 사용)
+{category_lines}
+
+### 지침
+- 반드시 위 스키마만 출력하고, 설명·마크다운 코드블록·주석은 절대 포함하지 마세요.
+- 문서에 해당 항목이 없으면 빈 배열([]) 또는 빈 문자열("")을 사용하세요.
+- 날짜가 명시되지 않은 경우 timeline 은 빈 배열로 반환하세요.
+- 한국어로 작성하세요.
+
+### 문서 텍스트
+"""
 
 
 def _init_client() -> genai.Client:
@@ -55,44 +112,12 @@ def _init_client() -> genai.Client:
 
 
 # =============================================
-# 프롬프트 템플릿
+# 프롬프트 초기화 (카테고리 동적 로드)
 # =============================================
-SYSTEM_PROMPT = """\
-당신은 대학 교무지원과의 행정 문서 분석 전문가입니다.
-아래 문서 텍스트를 읽고, 다음 JSON 스키마에 정확히 맞춰 정보를 추출하세요.
-
-### 출력 JSON 스키마
-{
-  "category":       "아래 카테고리 목록 중 하나를 선택 (반드시 목록에서만 선택)",
-  "task_name":      "업무명 (문서 제목 기반, 없으면 빈 문자열)",
-  "description":    "업무 개요 (2~4문장으로 요약)",
-  "precautions":    ["주의사항 1", "주의사항 2", ...],
-  "timeline":       [
-    {"date": "날짜 또는 기간 (예: 2025-03-01)", "action": "해야 할 일"}
-  ],
-  "related_depts":  ["협조 부서 또는 기관 1", "협조 부서 또는 기관 2", ...],
-  "deliverables":   ["산출물 또는 제출 서류 1", "산출물 또는 제출 서류 2", ...]
-}
-
-### 카테고리 목록 (category 필드에 아래 중 하나를 정확히 사용)
-- 겸직관리        : 교원 겸직 허가, 실태조사, 겸직 현황 보고 관련
-- 교원임용        : 신규 임용, 재임용, 승진, 계약 관련
-- 교원평가        : 업적평가, 강의평가, 다면평가 관련
-- 교원연수        : 연수 계획, 참가 안내, 결과 보고 관련
-- 학사운영        : 학사일정, 수업 운영, 수강신청, 학점 관련
-- 위원회운영      : 교무위원회, 인사위원회 등 각종 위원회 관련
-- 규정및지침      : 법령, 내부 규정, 가이드라인, 지침 문서
-- 통계및보고      : 각종 현황 통계, 실태조사 결과, 상급기관 보고
-- 기타            : 위 카테고리에 해당하지 않는 문서
-
-### 지침
-- 반드시 위 스키마만 출력하고, 설명·마크다운 코드블록·주석은 절대 포함하지 마세요.
-- 문서에 해당 항목이 없으면 빈 배열([]) 또는 빈 문자열("")을 사용하세요.
-- 날짜가 명시되지 않은 경우 timeline 은 빈 배열로 반환하세요.
-- 한국어로 작성하세요.
-
-### 문서 텍스트
-"""
+# categories.json 이 변경되어도 재시작만 하면 즉시 반영된다.
+_CATEGORIES   = load_categories()
+_DEFAULT_CAT  = _CATEGORIES[-1]["name"]   # 마지막 항목(보통 '기타')을 기본값으로
+SYSTEM_PROMPT = _build_system_prompt(_CATEGORIES)
 
 
 # =============================================
@@ -106,7 +131,7 @@ def parse_document(client: genai.Client, text: str, filename: str) -> dict:
     if not text or text.strip() in ("(텍스트 없음)", ""):
         logger.warning("텍스트 없음, 건너뜀: %s", filename)
         return {
-            "category": "기타",
+            "category": _DEFAULT_CAT,
             "task_name": filename,
             "description": "",
             "precautions": [],
@@ -148,7 +173,7 @@ def parse_document(client: genai.Client, text: str, filename: str) -> dict:
         logger.error("JSON 파싱 실패 (%s): %s", filename, exc)
         logger.debug("원본 응답:\n%s", getattr(response, 'text', 'N/A'))
         return {
-            "category": "기타",
+            "category": _DEFAULT_CAT,
             "task_name": filename,
             "_parse_status": "error_json",
             "_error": str(exc),
@@ -157,7 +182,7 @@ def parse_document(client: genai.Client, text: str, filename: str) -> dict:
     except Exception as exc:
         logger.error("API 오류 (%s): %s", filename, exc)
         return {
-            "category": "기타",
+            "category": _DEFAULT_CAT,
             "task_name": filename,
             "_parse_status": "error_api",
             "_error": str(exc),

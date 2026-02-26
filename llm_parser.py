@@ -31,7 +31,7 @@ FINAL_FILE  = BASE_DIR / "data" / "output.json"
 # Gemini API 초기화
 # =============================================
 # 사용할 모델 (무료 티어 지원)
-MODEL_ID = "gemini-2.0-flash"
+MODEL_ID = "gemini-2.5-flash-lite"
 
 # Gemini API 호출 설정 (JSON Mode 강제)
 _GENERATE_CONFIG = types.GenerateContentConfig(

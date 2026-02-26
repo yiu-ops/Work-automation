@@ -10,9 +10,21 @@ ZIP 파일을 압축 해제하고 확장자별로 텍스트를 추출한 뒤 JSO
 """
 
 import json
+import logging
+import struct
 import zipfile
+import zlib
 from datetime import datetime
 from pathlib import Path
+from xml.etree import ElementTree as ET
+
+import olefile
+import pandas as pd
+import pdfplumber
+from docx import Document
+
+logging.basicConfig(level=logging.WARNING,
+                    format="[%(levelname)s] %(message)s")
 
 # =============================================
 # 경로 설정
@@ -107,27 +119,159 @@ def extract_zips(raw_dir: Path, temp_dir: Path) -> list[dict]:
 
 
 # =============================================
-# 확장자별 텍스트 추출 함수 (추후 구현 예정)
+# 확장자별 텍스트 추출 함수
 # =============================================
 def extract_xlsx(filepath: Path) -> str:
-    """엑셀(.xlsx) 파일에서 텍스트 추출 — TODO: openpyxl"""
-    return f"[xlsx] {filepath.name} 에서 텍스트 추출 성공"
+    """엑셀(.xlsx) — pandas 로 모든 시트의 텍스트를 추출한다."""
+    try:
+        xl = pd.ExcelFile(filepath)
+        parts: list[str] = []
+        for sheet in xl.sheet_names:
+            df = xl.parse(sheet, header=None, dtype=str)
+            df = df.fillna("")
+            sheet_text = df.apply(lambda row: " ".join(row.astype(str)), axis=1)
+            parts.append(f"[시트: {sheet}]\n" + "\n".join(sheet_text))
+        return "\n\n".join(parts).strip()
+    except Exception as exc:
+        logging.error("xlsx 추출 실패 (%s): %s", filepath.name, exc)
+        return f"[오류] {exc}"
 
-def extract_hwp(filepath: Path) -> str:
-    """한글(.hwp) 파일에서 텍스트 추출 — TODO: pyhwp"""
-    return f"[hwp] {filepath.name} 에서 텍스트 추출 성공"
-
-def extract_hwpx(filepath: Path) -> str:
-    """한글(.hwpx) 파일에서 텍스트 추출 — TODO: hwpx 파싱"""
-    return f"[hwpx] {filepath.name} 에서 텍스트 추출 성공"
 
 def extract_pdf(filepath: Path) -> str:
-    """PDF 파일에서 텍스트 추출 — TODO: pdfplumber / pymupdf"""
-    return f"[pdf] {filepath.name} 에서 텍스트 추출 성공"
+    """PDF — pdfplumber 로 전체 페이지 텍스트를 추출한다."""
+    try:
+        texts: list[str] = []
+        with pdfplumber.open(filepath) as pdf:
+            for i, page in enumerate(pdf.pages, 1):
+                page_text = page.extract_text() or ""
+                if page_text.strip():
+                    texts.append(f"[{i}쪽]\n{page_text.strip()}")
+        return "\n\n".join(texts).strip() if texts else "(텍스트 없음)"
+    except Exception as exc:
+        logging.error("pdf 추출 실패 (%s): %s", filepath.name, exc)
+        return f"[오류] {exc}"
+
 
 def extract_docx(filepath: Path) -> str:
-    """워드(.docx) 파일에서 텍스트 추출 — TODO: python-docx"""
-    return f"[docx] {filepath.name} 에서 텍스트 추출 성공"
+    """워드(.docx) — python-docx 로 단락 및 표 텍스트를 추출한다."""
+    try:
+        doc = Document(str(filepath))
+        lines = [para.text for para in doc.paragraphs if para.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = " | ".join(
+                    cell.text.strip() for cell in row.cells if cell.text.strip()
+                )
+                if row_text:
+                    lines.append(row_text)
+        return "\n".join(lines).strip() if lines else "(텍스트 없음)"
+    except Exception as exc:
+        logging.error("docx 추출 실패 (%s): %s", filepath.name, exc)
+        return f"[오류] {exc}"
+
+
+def _parse_hwp_body(data: bytes) -> str:
+    """HWP BodyText 스트림(압축 해제된 바이너리)에서 텍스트를 파싱한다.
+
+    HWP 레코드 구조 (4바이트 헤더):
+      bits  0- 9 : 태그 ID
+      bits 10-19 : 레벨
+      bits 20-31 : 크기 (0xFFF 이면 다음 4바이트에 실제 크기)
+    HWPTAG_PARA_TEXT (67): UTF-16LE 문자 스트림
+    """
+    HWPTAG_PARA_TEXT = 67
+    pos = 0
+    chars: list[str] = []
+
+    while pos + 4 <= len(data):
+        header = struct.unpack_from("<I", data, pos)[0]
+        pos += 4
+        tag  = header & 0x3FF
+        size = (header >> 20) & 0xFFF
+
+        if size == 0xFFF:
+            if pos + 4 > len(data):
+                break
+            size = struct.unpack_from("<I", data, pos)[0]
+            pos += 4
+
+        if pos + size > len(data):
+            break
+
+        if tag == HWPTAG_PARA_TEXT:
+            text_bytes = data[pos: pos + size]
+            i = 0
+            while i < len(text_bytes) - 1:
+                code = struct.unpack_from("<H", text_bytes, i)[0]
+                i += 2
+                if code == 0x0A:
+                    chars.append("\n")
+                elif code < 0x20:
+                    # 인라인 오브젝트: 제어 코드 뒤 4워드(8바이트)는 파라미터이므로 건너뜀
+                    i += 8
+                else:
+                    try:
+                        chars.append(chr(code))
+                    except (ValueError, OverflowError):
+                        pass
+
+        pos += size
+
+    return "".join(chars).strip()
+
+
+def extract_hwp(filepath: Path) -> str:
+    """한글(.hwp) — olefile + zlib 으로 BodyText 스트림을 파싱한다."""
+    try:
+        if not olefile.isOleFile(filepath):
+            return "[오류] OLE 형식이 아닙니다."
+
+        with olefile.OleFileIO(str(filepath)) as ole:
+            header_data = ole.openstream("FileHeader").read()
+            compressed = bool(header_data[36] & 0x01)  # bit 0: 압축 여부
+
+            texts: list[str] = []
+            section = 0
+            while ole.exists(f"BodyText/Section{section}"):
+                raw = ole.openstream(f"BodyText/Section{section}").read()
+                body = zlib.decompress(raw, -15) if compressed else raw
+                section_text = _parse_hwp_body(body)
+                if section_text:
+                    texts.append(section_text)
+                section += 1
+
+        return "\n".join(texts).strip() if texts else "(텍스트 없음)"
+    except Exception as exc:
+        logging.error("hwp 추출 실패 (%s): %s", filepath.name, exc)
+        return f"[오류] {exc}"
+
+
+def extract_hwpx(filepath: Path) -> str:
+    """한글(.hwpx) — ZIP + XML 구조에서 <hp:t> 요소의 텍스트를 추출한다.
+
+    HWPX 는 ZIP 컨테이너이며 Contents/section*.xml 에 본문이 있다.
+    """
+    try:
+        texts: list[str] = []
+        with zipfile.ZipFile(filepath, "r") as zf:
+            section_files = sorted(
+                n for n in zf.namelist()
+                if n.startswith("Contents/") and n.lower().endswith(".xml")
+                and "section" in n.lower()
+            )
+            for name in section_files:
+                xml_bytes = zf.read(name)
+                root = ET.fromstring(xml_bytes)
+                for elem in root.iter():
+                    if elem.tag.endswith("}t") or elem.tag == "t":
+                        if elem.text and elem.text.strip():
+                            texts.append(elem.text)
+
+        return "\n".join(texts).strip() if texts else "(텍스트 없음)"
+    except Exception as exc:
+        logging.error("hwpx 추출 실패 (%s): %s", filepath.name, exc)
+        return f"[오류] {exc}"
+
 
 EXTRACTOR_MAP = {
     ".xlsx": extract_xlsx,

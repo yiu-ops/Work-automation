@@ -63,15 +63,27 @@ SYSTEM_PROMPT = """\
 
 ### 출력 JSON 스키마
 {
+  "category":       "아래 카테고리 목록 중 하나를 선택 (반드시 목록에서만 선택)",
   "task_name":      "업무명 (문서 제목 기반, 없으면 빈 문자열)",
   "description":    "업무 개요 (2~4문장으로 요약)",
   "precautions":    ["주의사항 1", "주의사항 2", ...],
   "timeline":       [
     {"date": "날짜 또는 기간 (예: 2025-03-01)", "action": "해야 할 일"}
   ],
-  "related_depts":  ["협조 부서 1", "협조 부서 2", ...],
-  "deliverables":   ["산출물 1", "산출물 2", ...]
+  "related_depts":  ["협조 부서 또는 기관 1", "협조 부서 또는 기관 2", ...],
+  "deliverables":   ["산출물 또는 제출 서류 1", "산출물 또는 제출 서류 2", ...]
 }
+
+### 카테고리 목록 (category 필드에 아래 중 하나를 정확히 사용)
+- 겸직관리        : 교원 겸직 허가, 실태조사, 겸직 현황 보고 관련
+- 교원임용        : 신규 임용, 재임용, 승진, 계약 관련
+- 교원평가        : 업적평가, 강의평가, 다면평가 관련
+- 교원연수        : 연수 계획, 참가 안내, 결과 보고 관련
+- 학사운영        : 학사일정, 수업 운영, 수강신청, 학점 관련
+- 위원회운영      : 교무위원회, 인사위원회 등 각종 위원회 관련
+- 규정및지침      : 법령, 내부 규정, 가이드라인, 지침 문서
+- 통계및보고      : 각종 현황 통계, 실태조사 결과, 상급기관 보고
+- 기타            : 위 카테고리에 해당하지 않는 문서
 
 ### 지침
 - 반드시 위 스키마만 출력하고, 설명·마크다운 코드블록·주석은 절대 포함하지 마세요.
@@ -94,6 +106,7 @@ def parse_document(client: genai.Client, text: str, filename: str) -> dict:
     if not text or text.strip() in ("(텍스트 없음)", ""):
         logger.warning("텍스트 없음, 건너뜀: %s", filename)
         return {
+            "category": "기타",
             "task_name": filename,
             "description": "",
             "precautions": [],
@@ -135,6 +148,7 @@ def parse_document(client: genai.Client, text: str, filename: str) -> dict:
         logger.error("JSON 파싱 실패 (%s): %s", filename, exc)
         logger.debug("원본 응답:\n%s", getattr(response, 'text', 'N/A'))
         return {
+            "category": "기타",
             "task_name": filename,
             "_parse_status": "error_json",
             "_error": str(exc),
@@ -143,6 +157,7 @@ def parse_document(client: genai.Client, text: str, filename: str) -> dict:
     except Exception as exc:
         logger.error("API 오류 (%s): %s", filename, exc)
         return {
+            "category": "기타",
             "task_name": filename,
             "_parse_status": "error_api",
             "_error": str(exc),

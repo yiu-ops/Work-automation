@@ -140,13 +140,13 @@ def preprocess_extracted_data():
 # =============================================
 class RAGSystem:
     def __init__(self):
-        self.api_key = os.getenv("GOOGLE_API_KEY")
+        self.api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
-            raise ValueError("GOOGLE_API_KEY 환경 변수가 설정되지 않았습니다.")
+            raise ValueError("GOOGLE_API_KEY 또는 GEMINI_API_KEY 환경 변수가 설정되지 않았습니다.")
         
-        # 임베딩 모델 설정 (text-embedding-004 추천, 없으면 embedding-001 사용)
+        # 임베딩 모델 설정 (text-embedding-004 대신 embedding-001 사용)
         self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004", 
+            model="models/embedding-001", 
             google_api_key=self.api_key
         )
         

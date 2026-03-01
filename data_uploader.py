@@ -115,10 +115,12 @@ def _log_failure(record: dict[str, Any], reason: str) -> None:
 
 def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     """
-    core_regulations / action_triggers 가 문자열로 들어온 경우 리스트로 변환.
+    core_regulations / action_triggers / reference_documents 가
+    문자열로 들어온 경우 리스트로 변환.
     lessons_learned 가 리스트인 경우 줄바꿈 문자열로 병합.
+    document_count 가 없으면 0 으로 기본값 설정.
     """
-    for key in ("core_regulations", "action_triggers"):
+    for key in ("core_regulations", "action_triggers", "reference_documents"):
         val = record.get(key)
         if isinstance(val, str):
             record[key] = [v.strip() for v in val.split(",") if v.strip()]
@@ -128,6 +130,15 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     ll = record.get("lessons_learned")
     if isinstance(ll, list):
         record["lessons_learned"] = "\n".join(ll)
+
+    # 신규 텍스트 필드 기본값
+    for key in ("compliance_check", "recurrence_pattern", "semester"):
+        if record.get(key) is None:
+            record[key] = ""
+
+    # document_count 기본값
+    if record.get("document_count") is None:
+        record["document_count"] = 0
 
     return record
 

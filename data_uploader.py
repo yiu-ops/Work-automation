@@ -147,10 +147,84 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
 #  방법 1 : Supabase Uploader
 # ══════════════════════════════════════════════════════════════════
 
+# 원래 스키마에 있던 컬럼 (항상 존재)
+_ORIGINAL_COLUMNS = {
+    "task_name", "target_date", "core_regulations",
+    "action_triggers", "lessons_learned", "source_file",
+}
+# v2에서 추가된 컬럼
+_NEW_COLUMNS = {
+    "reference_documents", "compliance_check",
+    "recurrence_pattern", "document_count", "semester",
+}
+
+def _try_migrate(supabase_url: str, supabase_key: str) -> bool:
+    """
+    Supabase 테이블에 v2 신규 컬럼이 없으면 ALTER TABLE 을 시도합니다.
+    anon key 환경에서는 DDL 실패 가능 → False 반환 (업로드는 계속됨).
+    """
+    ddl = """
+    ALTER TABLE gyomu_tasks
+      ADD COLUMN IF NOT EXISTS reference_documents JSONB    DEFAULT '[]',
+      ADD COLUMN IF NOT EXISTS compliance_check    TEXT     DEFAULT '',
+      ADD COLUMN IF NOT EXISTS recurrence_pattern  TEXT     DEFAULT '',
+      ADD COLUMN IF NOT EXISTS document_count      INTEGER  DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS semester            TEXT     DEFAULT '';
+    """
+    # Supabase Management SQL API (서비스 롤 키 또는 PAT 필요)
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+    }
+    ref = supabase_url.replace("https://", "").split(".")[0]
+    mgmt_url = f"https://api.supabase.com/v1/projects/{ref}/database/query"
+    try:
+        resp = requests.post(
+            mgmt_url,
+            headers=headers,
+            json={"query": ddl},
+            timeout=15,
+        )
+        if resp.status_code in (200, 201):
+            logger.info("[Migration] ✓ v2 컬럼 추가 완료")
+            return True
+        else:
+            logger.debug(
+                "[Migration] Management API 응답 %s — 수동 SQL 실행 필요: "
+                "supabase_migration_v2.sql",
+                resp.status_code,
+            )
+            return False
+    except Exception as e:
+        logger.debug("[Migration] 자동 마이그레이션 실패 (%s) — 계속 진행", e)
+        return False
+
+
+def _detect_existing_columns(client: Any) -> set[str]:
+    """
+    gyomu_tasks 에 실제 존재하는 컬럼 집합을 반환합니다.
+    조회 실패 시 원래 스키마만 반환 (안전 폴백).
+    """
+    try:
+        # 1행만 SELECT → 응답 키에서 컬럼명 추론
+        resp = client.table("gyomu_tasks").select("*").limit(1).execute()
+        if resp.data:
+            return set(resp.data[0].keys())
+        # 데이터가 없으면 원래 + 신규 모두 시도 가능하다고 가정
+        return _ORIGINAL_COLUMNS | _NEW_COLUMNS
+    except Exception:
+        return _ORIGINAL_COLUMNS
+
+
 class SupabaseUploader:
     """
     supabase-py 를 사용해 gyomu_tasks 테이블에 upsert 합니다.
     중복 방지 기준: task_name (UNIQUE 제약)
+
+    [v2 자동 마이그레이션]
+    초기화 시 Management API 로 ALTER TABLE 을 시도하고,
+    실패해도 기존 컬럼만으로 upsert(폴백)하여 파이프라인이 중단되지 않습니다.
     """
 
     def __init__(self) -> None:
@@ -167,13 +241,38 @@ class SupabaseUploader:
         self.client = create_client(SUPABASE_URL, SUPABASE_KEY)
         logger.info("[Supabase] 클라이언트 초기화 완료")
 
+        # 자동 마이그레이션 시도 (실패해도 무시)
+        self._migrated = _try_migrate(SUPABASE_URL, SUPABASE_KEY)
+
+        # 실제 테이블 컬럼 감지
+        self._existing_cols = _detect_existing_columns(self.client)
+        new_found = _NEW_COLUMNS & self._existing_cols
+        new_missing = _NEW_COLUMNS - self._existing_cols
+        if new_found:
+            logger.info("[Supabase] v2 컬럼 확인됨: %s", ", ".join(sorted(new_found)))
+        if new_missing:
+            logger.warning(
+                "[Supabase] v2 컬럼 미존재 (폴백 모드): %s\n"
+                "  → 분석 결과는 JSON에 저장되지만 Supabase에는 기존 필드만 업로드됩니다.\n"
+                "  → supabase_migration_v2.sql 을 Supabase SQL Editor에서 실행하면 모든 필드가 저장됩니다.",
+                ", ".join(sorted(new_missing)),
+            )
+
+    def _build_payload(self, record: dict[str, Any], source_file: str) -> dict[str, Any]:
+        """실제 테이블에 존재하는 컬럼만 포함한 페이로드를 생성합니다."""
+        allowed = _ORIGINAL_COLUMNS | (self._existing_cols & _NEW_COLUMNS)
+        payload = {k: v for k, v in record.items() if k in allowed}
+        payload["source_file"] = source_file
+        return payload
+
     def upload(self, record: dict[str, Any], source_file: str = "") -> bool:
         """
         단건 upsert.
         on_conflict="task_name" → 동일 task_name 이면 UPDATE, 없으면 INSERT.
+        컬럼 오류 발생 시 원래 스키마만으로 재시도합니다.
         """
         payload = _normalize(record.copy())
-        payload["source_file"] = source_file
+        payload = self._build_payload(payload, source_file)
 
         try:
             resp = (
@@ -181,7 +280,6 @@ class SupabaseUploader:
                 .upsert(payload, on_conflict="task_name")
                 .execute()
             )
-            # supabase-py v2 는 resp.data 가 삽입/수정된 행 리스트
             if resp.data:
                 task = resp.data[0].get("task_name", "")
                 logger.info("  ✓ upsert 성공: %s", task)
@@ -191,6 +289,33 @@ class SupabaseUploader:
                 _log_failure(payload, "supabase: empty response data")
                 return False
         except Exception as exc:
+            exc_str = str(exc)
+            # 알 수 없는 컬럼 오류 → 신규 필드 제거 후 재시도
+            if "column" in exc_str.lower() and (
+                "does not exist" in exc_str or "unknown" in exc_str.lower()
+            ):
+                logger.warning(
+                    "  ⚠ 컬럼 오류 감지 → 기존 스키마만으로 재시도: %s", exc_str[:120]
+                )
+                # 신규 컬럼을 known_missing으로 표시하여 이후 업로드에서도 제외
+                self._existing_cols -= _NEW_COLUMNS
+                fallback = {k: v for k, v in payload.items() if k in _ORIGINAL_COLUMNS | {"source_file"}}
+                try:
+                    resp2 = (
+                        self.client.table("gyomu_tasks")
+                        .upsert(fallback, on_conflict="task_name")
+                        .execute()
+                    )
+                    if resp2.data:
+                        logger.info(
+                            "  ✓ 폴백 upsert 성공 (기존 필드만): %s",
+                            resp2.data[0].get("task_name", ""),
+                        )
+                        return True
+                except Exception as exc2:
+                    logger.error("  ✗ 폴백 upsert도 실패: %s", exc2)
+                    _log_failure(fallback, f"supabase fallback: {exc2}")
+                    return False
             logger.error("  ✗ Supabase 오류: %s", exc)
             _log_failure(payload, f"supabase: {exc}")
             return False
@@ -199,7 +324,6 @@ class SupabaseUploader:
         """다건 처리. (성공 수, 실패 수) 반환."""
         ok, fail = 0, 0
         for rec in records:
-            (ok if self.upload(rec, source_file) else fail).__class__  # noqa
             if self.upload(rec, source_file):
                 ok += 1
             else:

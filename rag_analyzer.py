@@ -26,15 +26,6 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-# Processor 모듈 임포트 (ZIP 및 다양한 문서 포맷 처리용)
-try:
-    import processor
-except ImportError:
-    # processor.py가 같은 디렉토리에 없을 경우를 대비해 경로 추가
-    import sys
-    sys.path.append(str(Path(__file__).parent))
-    import processor
-
 # LangChain Imports
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_chroma import Chroma
@@ -70,89 +61,24 @@ class AnalysisResult(BaseModel):
     lessons_learned: List[str] = Field(description="문서에서 파악된 지난 학기 부족했던 점이나 주의사항, 개선점")
 
 # =============================================
-# ZIP 및 문서 전처리 함수
-# =============================================
-def preprocess_extracted_data():
-    """
-    data/extracted/ 폴더 내의 ZIP 파일을 찾아 압축을 풀고,
-    processor.py를 이용해 텍스트를 추출하여 .txt 파일로 변환합니다.
-    """
-    if not EXTRACTED_DIR.exists():
-        return
-
-    # ZIP 파일이 있는지 확인
-    zip_files = list(EXTRACTED_DIR.glob("*.zip"))
-    if not zip_files:
-        return
-
-    logger.info(f"ZIP 파일 {len(zip_files)}개를 발견하여 전처리를 시작합니다...")
-
-    # 임시 폴더 설정
-    temp_dir = EXTRACTED_DIR / "temp_extracted"
-    
-    # 1. 압축 해제 및 파일 목록 수집 (processor.py 활용)
-    # 주의: extract_zips는 폴더 내 모든 파일을 스캔하므로, 반환값에서 ZIP 출처인 것만 필터링해야 함
-    try:
-        entries = processor.extract_zips(EXTRACTED_DIR, temp_dir)
-    except Exception as e:
-        logger.error(f"ZIP 파일 처리 중 오류 발생: {e}")
-        return
-
-    # 2. ZIP에서 나온 파일만 필터링
-    zip_entries = [e for e in entries if e.get("source_zip") is not None]
-    
-    if not zip_entries:
-        logger.info("처리할 압축 파일 내용이 없습니다.")
-        return
-
-    # 3. 텍스트 추출
-    logger.info(f"문서 변환 시작 ({len(zip_entries)}개 파일)...")
-    records = processor.process_files(zip_entries)
-
-    # 4. 추출된 텍스트를 .txt 파일로 저장
-    converted_count = 0
-    for record in records:
-        if record.get("status") == "ok" and record.get("text"):
-            # 파일명 생성: [ZIP파일명]_[원본파일명].txt
-            zip_name = Path(record["source_zip"]).stem
-            orig_name = Path(record["filename"]).stem
-            # 특수문자 제거 등은 processor가 해주지 않으므로 간단히 처리
-            safe_name = f"[{zip_name}]_{orig_name}.txt"
-            
-            output_path = EXTRACTED_DIR / safe_name
-            
-            # 이미 존재하면 덮어쓸지 여부? 여기선 덮어씀
-            try:
-                with open(output_path, "w", encoding="utf-8") as f:
-                    f.write(record["text"])
-                converted_count += 1
-            except Exception as e:
-                logger.error(f"파일 저장 실패 ({output_path}): {e}")
-
-    logger.info(f"전처리 완료: {converted_count}개의 텍스트 파일이 생성되었습니다.")
-    
-    # (선택) 임시 폴더 정리
-    # shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-# =============================================
 # RAG 시스템 클래스
 # =============================================
 class RAGSystem:
     def __init__(self):
+        # .env의 GEMINI_API_KEY 또는 GOOGLE_API_KEY 모두 지원
         self.api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError("GOOGLE_API_KEY 또는 GEMINI_API_KEY 환경 변수가 설정되지 않았습니다.")
         
-        # 임베딩 모델 설정 (text-embedding-004 대신 embedding-001 사용)
+        # 임베딩 모델 설정 (gemini-embedding-001: 최신 안정 버전)
         self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001", 
+            model="models/gemini-embedding-001",
             google_api_key=self.api_key
         )
         
-        # LLM 모델 설정 (Gemini 1.5 Flash 사용)
+        # LLM 모델 설정 (gemini-2.5-flash: 최신 안정 버전)
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",
+            model="gemini-2.5-flash",
             temperature=0,
             google_api_key=self.api_key
         )
@@ -178,23 +104,35 @@ class RAGSystem:
 
         logger.info("규정집 문서를 로드하고 청크로 분할합니다...")
         
-        # 문서 로드 (.txt, .md 파일 지원)
-        loader = DirectoryLoader(str(REFERENCE_DIR), glob="**/*.txt", loader_cls=TextLoader, show_progress=True)
-        documents = loader.load()
-        
-        if not documents:
-            # .md 파일도 시도
-            loader_md = DirectoryLoader(str(REFERENCE_DIR), glob="**/*.md", loader_cls=TextLoader, show_progress=True)
-            documents.extend(loader_md.load())
+        documents = []
+
+        # PDF 파일 로드
+        for pdf_file in REFERENCE_DIR.glob("**/*.pdf"):
+            try:
+                loader = PyPDFLoader(str(pdf_file))
+                documents.extend(loader.load())
+                logger.info(f"  PDF 로드: {pdf_file.name} ({len(loader.load())}페이지)")
+            except Exception as e:
+                logger.warning(f"  PDF 로드 실패 [{pdf_file.name}]: {e}")
+
+        # TXT 파일 로드
+        for txt_file in REFERENCE_DIR.glob("**/*.txt"):
+            try:
+                loader = TextLoader(str(txt_file), encoding="utf-8")
+                documents.extend(loader.load())
+            except Exception as e:
+                logger.warning(f"  TXT 로드 실패 [{txt_file.name}]: {e}")
+
+        # MD 파일 로드
+        for md_file in REFERENCE_DIR.glob("**/*.md"):
+            try:
+                loader = TextLoader(str(md_file), encoding="utf-8")
+                documents.extend(loader.load())
+            except Exception as e:
+                logger.warning(f"  MD 로드 실패 [{md_file.name}]: {e}")
             
-        # .pdf 파일 추가
-        loader_pdf = DirectoryLoader(str(REFERENCE_DIR), glob="**/*.pdf", loader_cls=PyPDFLoader, show_progress=True)
-        pdf_docs = loader_pdf.load()
-        if pdf_docs:
-            documents.extend(pdf_docs)
-            
         if not documents:
-            logger.warning("data/reference/ 폴더에 처리할 문서가 없습니다.")
+            logger.warning("data/reference/ 폴더에 처리할 문서가 없습니다. (PDF/TXT/MD 파일 확인)")
             return
 
         # 청크 분할 (CharacterTextSplitter 사용)
@@ -228,13 +166,8 @@ class RAGSystem:
 
         # 기안 문서 읽기
         try:
-            if doc_path.suffix.lower() == '.pdf':
-                loader = PyPDFLoader(str(doc_path))
-                pages = loader.load()
-                doc_content = "\n".join([page.page_content for page in pages])
-            else:
-                with open(doc_path, "r", encoding="utf-8") as f:
-                    doc_content = f.read()
+            with open(doc_path, "r", encoding="utf-8") as f:
+                doc_content = f.read()
         except Exception as e:
             logger.error(f"문서 읽기 실패 ({doc_path}): {e}")
             return None
@@ -288,28 +221,24 @@ if __name__ == "__main__":
     # rag.build_vector_db(force_rebuild=True) 
     rag.build_vector_db()
 
-    # 2. ZIP 파일 등 전처리 (텍스트 추출)
-    preprocess_extracted_data()
-
-    # 3. 추출된 기안 문서 처리
+    # 2. 추출된 기안 문서 처리
     processed_count = 0
     if not EXTRACTED_DIR.exists():
          logger.warning(f"'{EXTRACTED_DIR}' 폴더가 없습니다. 텍스트 파일을 넣어주세요.")
     else:
-        # .txt 및 .pdf 파일 모두 검색
-        doc_files = list(EXTRACTED_DIR.glob("*.txt")) + list(EXTRACTED_DIR.glob("*.pdf"))
-        logger.info(f"분석 대상 문서: {len(doc_files)}개")
+        txt_files = list(EXTRACTED_DIR.glob("*.txt"))
+        logger.info(f"분석 대상 문서: {len(txt_files)}개")
 
-        for doc_file in doc_files:
-            result = rag.analyze_document(doc_file)
+        for txt_file in txt_files:
+            result = rag.analyze_document(txt_file)
             if result:
                 # 결과 저장
-                output_path = OUTPUT_DIR / f"{doc_file.stem}_analysis.json"
+                output_path = OUTPUT_DIR / f"{txt_file.stem}_analysis.json"
                 with open(output_path, "w", encoding="utf-8") as f:
                     json.dump(result.model_dump(), f, ensure_ascii=False, indent=2)
                 logger.info(f"분석 완료 및 저장: {output_path}")
                 processed_count += 1
             else:
-                logger.warning(f"분석 실패: {doc_file.name}")
+                logger.warning(f"분석 실패: {txt_file.name}")
 
     logger.info(f"총 {processed_count}개 문서 분석 완료.")

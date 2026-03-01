@@ -45,8 +45,14 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.language_models import BaseChatModel
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import DirectoryLoader, TextLoader, PyPDFLoader
+try:
+    from langchain_groq import ChatGroq
+    _GROQ_AVAILABLE = True
+except ImportError:
+    _GROQ_AVAILABLE = False
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -129,29 +135,76 @@ class AnalysisResult(BaseModel):
     )
 
 # =============================================
+# 모델 폴백 목록 (쿼터 초과 시 순서대로 시도)
+# ─────────────────────────────────────────────
+# 형식:
+#   "gemini-xxx"         → Google Gemini API
+#   "groq:model-name"    → Groq API (langchain-groq)
+# =============================================
+_FALLBACK_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "groq:llama-3.3-70b-versatile",   # 무료 14,400회/일, 빠른 응답
+    "groq:llama-3.1-8b-instant",      # 더 가벼운 Groq 백업
+]
+
+def _pick_model_from_args() -> str:
+    """
+    CLI: --model gemini-2.0-flash  또는  env: GEMINI_MODEL=gemini-2.0-flash
+    지정이 없으면 _FALLBACK_MODELS[0] 사용.
+    """
+    for i, arg in enumerate(sys.argv):
+        if arg == "--model" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return os.getenv("GEMINI_MODEL", _FALLBACK_MODELS[0])
+
+
+# =============================================
 # RAG 시스템 클래스 v2
 # =============================================
 class RAGSystem:
-    def __init__(self):
+    def __init__(self, model: Optional[str] = None):
         # .env의 GEMINI_API_KEY 또는 GOOGLE_API_KEY 모두 지원
         self.api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        self.groq_api_key = os.getenv("GROQ_API_KEY")
         if not self.api_key:
             raise ValueError("GOOGLE_API_KEY 또는 GEMINI_API_KEY 환경 변수가 설정되지 않았습니다.")
-        
-        # 임베딩 모델
+
+        self._model_name = model or _pick_model_from_args()
+        logger.info(f"[LLM] 사용 모델: {self._model_name}")
+
+        # 임베딩 모델 (항상 Gemini 사용)
         self.embeddings = GoogleGenerativeAIEmbeddings(
             model="models/gemini-embedding-001",
             google_api_key=self.api_key
         )
-        
+
         # LLM (temperature=0: 재현성 확보)
-        self.llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            temperature=0,
-            google_api_key=self.api_key
-        )
-        
+        self.llm = self._make_llm(self._model_name)
+
         self.vector_store = None
+
+    def _make_llm(self, model_spec: str) -> BaseChatModel:
+        """model_spec이 'groq:...' 이면 ChatGroq, 아니면 ChatGoogleGenerativeAI 반환."""
+        if model_spec.startswith("groq:"):
+            if not _GROQ_AVAILABLE:
+                raise ImportError("langchain-groq 패키지가 설치되지 않았습니다. pip install langchain-groq")
+            if not self.groq_api_key:
+                raise ValueError("GROQ_API_KEY 환경 변수가 설정되지 않았습니다.")
+            groq_model = model_spec[len("groq:"):]
+            logger.info(f"  → Groq API 사용: {groq_model}")
+            return ChatGroq(
+                model=groq_model,
+                temperature=0,
+                groq_api_key=self.groq_api_key,
+            )
+        else:
+            return ChatGoogleGenerativeAI(
+                model=model_spec,
+                temperature=0,
+                google_api_key=self.api_key,
+            )
 
     # ──────────────────────────────────────────────────────────
     # 1단계: 규정집 벡터화
@@ -303,23 +356,95 @@ class RAGSystem:
              "문서 수={doc_count}, 업무명={task_name}")
         ])
 
-        chain = prompt | self.llm | parser
+        invoke_kwargs = {
+            "context": context_text,
+            "task_docs": combined_text[:12000],  # 루프 안에서 크기 조정됨
+            "doc_count": len(all_contents),
+            "task_name": task_name,
+            "format_instructions": parser.get_format_instructions(),
+        }
 
-        try:
-            result = chain.invoke({
-                "context": context_text,
-                "task_docs": combined_text[:12000],  # 토큰 한도 고려, 앞 12000자
-                "doc_count": len(all_contents),
-                "task_name": task_name,
-                "format_instructions": parser.get_format_instructions(),
-            })
-            # document_count가 0이면 실제 값으로 보정
-            if result.document_count == 0:
-                object.__setattr__(result, "document_count", len(all_contents))
-            return result
-        except Exception as e:
-            logger.error(f"[{task_name}] LLM 분석 중 오류: {e}")
-            return None
+        # ── 모델 폴백 시도 ───────────────────────────────────
+        # 쿼터 초과(429) → 다음 모델
+        # 페이로드 초과(413) → 텍스트 절반 축소 후 동일 모델 재시도(최대 3회)
+        # 파싱 실패(null) → 다음 모델
+        current_idx = _FALLBACK_MODELS.index(self._model_name) \
+            if self._model_name in _FALLBACK_MODELS else 0
+        candidates = _FALLBACK_MODELS[current_idx:] + _FALLBACK_MODELS[:current_idx]
+
+        text_limit = 12000  # 초기 텍스트 한도
+
+        for attempt_model in candidates:
+            if attempt_model != self._model_name:
+                logger.warning(f"[{task_name}] 모델 전환 시도: {attempt_model}")
+
+            size_retries = 0
+            current_limit = text_limit
+
+            while size_retries <= 3:
+                invoke_kwargs["task_docs"] = combined_text[:current_limit]
+                try:
+                    llm = self._make_llm(attempt_model)
+                    result = (prompt | llm | parser).invoke(invoke_kwargs)
+                    if attempt_model != self._model_name:
+                        logger.info(f"[{task_name}] {attempt_model} 로 성공 (텍스트 {current_limit}자)")
+                    # document_count 보정
+                    if result.document_count == 0:
+                        object.__setattr__(result, "document_count", len(all_contents))
+                    return result
+
+                except Exception as e:
+                    err = str(e)
+
+                    # 413 Payload Too Large → 텍스트 축소 후 재시도
+                    is_size_err = (
+                        "413" in err
+                        or "payload too large" in err.lower()
+                        or "request too large" in err.lower()
+                        or "context_length_exceeded" in err.lower()
+                    )
+                    if is_size_err:
+                        current_limit = current_limit // 2
+                        size_retries += 1
+                        logger.warning(
+                            f"[{task_name}] {attempt_model} 페이로드 초과 → "
+                            f"텍스트 {current_limit}자로 축소 재시도 ({size_retries}/3)"
+                        )
+                        continue
+
+                    # 쿼터/속도 제한 → 다음 모델
+                    is_quota_err = (
+                        "429" in err
+                        or "RESOURCE_EXHAUSTED" in err
+                        or "quota" in err.lower()
+                        or "rate_limit" in err.lower()
+                        or "rate limit" in err.lower()
+                    )
+                    if is_quota_err:
+                        logger.warning(
+                            f"[{task_name}] {attempt_model} 쿼터/한도 초과 → 다음 모델 시도"
+                        )
+                        break  # while 탈출 → 다음 모델
+
+                    # JSON 파싱 실패 → 다음 모델
+                    is_parse_err = (
+                        "Failed to parse" in err
+                        or "completion null" in err
+                        or "validation error" in err.lower()
+                    )
+                    if is_parse_err:
+                        logger.warning(
+                            f"[{task_name}] {attempt_model} JSON 파싱 실패 → 다음 모델 시도"
+                        )
+                        break  # while 탈출 → 다음 모델
+
+                    # 그 외 오류 (키 오류, 네트워크 등) → 즉시 실패
+                    logger.error(f"[{task_name}] LLM 분석 오류 ({attempt_model}): {e}")
+                    return None
+
+        logger.error(f"[{task_name}] 모든 모델 실패. API 키 및 쿼터를 확인하세요.")
+        return None
+        return None
 
     # ──────────────────────────────────────────────────────────
     # (하위 호환) 단일 문서 분석 — 기존 코드 호환용
@@ -349,11 +474,14 @@ def extract_task_name(filename: str) -> Optional[str]:
 # =============================================
 if __name__ == "__main__":
     force_rebuild = "--rebuild-db" in sys.argv
+    # --model 인자로 시작 모델 지정 가능
+    # 예: python rag_analyzer.py --model gemini-2.0-flash
+    start_model = _pick_model_from_args()
 
     if not OUTPUT_DIR.exists():
         OUTPUT_DIR.mkdir(parents=True)
 
-    rag = RAGSystem()
+    rag = RAGSystem(model=start_model)
     rag.build_vector_db(force_rebuild=force_rebuild)
 
     if not EXTRACTED_DIR.exists():

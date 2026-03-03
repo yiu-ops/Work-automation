@@ -204,7 +204,7 @@ def _try_migrate(supabase_url: str, supabase_key: str) -> bool:
         else:
             logger.debug(
                 "[Migration] Management API 응답 %s — 수동 SQL 실행 필요: "
-                "supabase_migration_v2.sql",
+                "supabase_migration_v3.sql",
                 resp.status_code,
             )
             return False
@@ -261,12 +261,12 @@ class SupabaseUploader:
         new_found = (_NEW_COLUMNS | _V3_COLUMNS) & self._existing_cols
         new_missing = (_NEW_COLUMNS | _V3_COLUMNS) - self._existing_cols
         if new_found:
-            logger.info("[Supabase] v2 컬럼 확인됨: %s", ", ".join(sorted(new_found)))
+            logger.info("[Supabase] v3 컬럼 확인됨: %s", ", ".join(sorted(new_found)))
         if new_missing:
             logger.warning(
-                "[Supabase] v2 컬럼 미존재 (폴백 모드): %s\n"
+                "[Supabase] v3 컬럼 미존재 (폴백 모드): %s\n"
                 "  → 분석 결과는 JSON에 저장되지만 Supabase에는 기존 필드만 업로드됩니다.\n"
-                "  → supabase_migration_v2.sql 을 Supabase SQL Editor에서 실행하면 모든 필드가 저장됩니다.",
+                "  → supabase_migration_v3.sql 을 Supabase SQL Editor에서 실행하면 모든 필드가 저장됩니다.",
                 ", ".join(sorted(new_missing)),
             )
 

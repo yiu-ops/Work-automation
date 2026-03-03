@@ -46,6 +46,7 @@ from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.language_models import BaseChatModel
+from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import DirectoryLoader, TextLoader, PyPDFLoader
 try:
@@ -53,6 +54,15 @@ try:
     _GROQ_AVAILABLE = True
 except ImportError:
     _GROQ_AVAILABLE = False
+
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+    _HF_AVAILABLE = True
+except ImportError:
+    _HF_AVAILABLE = False
+
+# 로컬 임베딩 모델 (API 키·쿼터 불필요, 한국어 지원)
+_LOCAL_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -194,11 +204,22 @@ def _pick_model_from_args() -> str:
     return os.getenv("GEMINI_MODEL", _FALLBACK_MODELS[0])
 
 
+def _pick_embedding_from_args() -> str:
+    """
+    CLI: --embedding local   → 로컬 HuggingFace 모델 사용 (API 키 불필요)
+    CLI: --embedding gemini  → Google Gemini 임베딩 사용 (기본값)
+    """
+    for i, arg in enumerate(sys.argv):
+        if arg == "--embedding" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1].lower()
+    return os.getenv("EMBEDDING_PROVIDER", "gemini")
+
+
 # =============================================
 # RAG 시스템 클래스 v2
 # =============================================
 class RAGSystem:
-    def __init__(self, model: Optional[str] = None):
+    def __init__(self, model: Optional[str] = None, embedding: Optional[str] = None):
         # .env의 GEMINI_API_KEY 또는 GOOGLE_API_KEY 모두 지원
         self.api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
         self.groq_api_key = os.getenv("GROQ_API_KEY")
@@ -206,18 +227,37 @@ class RAGSystem:
             raise ValueError("GOOGLE_API_KEY 또는 GEMINI_API_KEY 환경 변수가 설정되지 않았습니다.")
 
         self._model_name = model or _pick_model_from_args()
+        self._embedding_provider = (embedding or _pick_embedding_from_args()).lower()
         logger.info(f"[LLM] 사용 모델: {self._model_name}")
+        logger.info(f"[Embedding] 제공자: {self._embedding_provider}")
 
-        # 임베딩 모델 (항상 Gemini 사용)
-        self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/gemini-embedding-001",
-            google_api_key=self.api_key
-        )
+        # 임베딩 모델 선택
+        self.embeddings: Embeddings = self._make_embeddings()
 
         # LLM (temperature=0: 재현성 확보)
         self.llm = self._make_llm(self._model_name)
 
         self.vector_store = None
+
+    def _make_embeddings(self) -> Embeddings:
+        """--embedding local 이면 HuggingFace 로컬 모델, 아니면 Gemini 사용."""
+        if self._embedding_provider == "local":
+            if not _HF_AVAILABLE:
+                raise ImportError(
+                    "langchain-huggingface 패키지가 없습니다.\n"
+                    "pip install langchain-huggingface sentence-transformers"
+                )
+            logger.info(f"  → 로컬 모델 로딩: {_LOCAL_EMBED_MODEL} (첫 실행 시 다운로드 ~450MB)")
+            return HuggingFaceEmbeddings(
+                model_name=_LOCAL_EMBED_MODEL,
+                model_kwargs={"device": "cpu"},
+                encode_kwargs={"normalize_embeddings": True},
+            )
+        else:
+            return GoogleGenerativeAIEmbeddings(
+                model="models/gemini-embedding-001",
+                google_api_key=self.api_key,
+            )
 
     def _make_llm(self, model_spec: str) -> BaseChatModel:
         """model_spec이 'groq:...' 이면 ChatGroq, 아니면 ChatGoogleGenerativeAI 반환."""
@@ -295,12 +335,29 @@ class RAGSystem:
         splits = text_splitter.split_documents(documents)
         logger.info(f"총 {len(documents)}개 문서를 {len(splits)}개 청크로 분할했습니다.")
 
+        import time
+
         logger.info("벡터 DB를 생성 중입니다...")
-        self.vector_store = Chroma.from_documents(
-            documents=splits,
-            embedding=self.embeddings,
-            persist_directory=str(CHROMA_DB_DIR)
-        )
+        # ── 배치(100청크) 단위로 임베딩 — Gemini 분당 한도 초과 방지 ──
+        BATCH = 100
+        self.vector_store = None
+        for i in range(0, len(splits), BATCH):
+            batch = splits[i : i + BATCH]
+            batch_no = i // BATCH + 1
+            total_batches = (len(splits) + BATCH - 1) // BATCH
+            logger.info(f"  임베딩 배치 {batch_no}/{total_batches} ({len(batch)}청크)...")
+            if self.vector_store is None:
+                self.vector_store = Chroma.from_documents(
+                    documents=batch,
+                    embedding=self.embeddings,
+                    persist_directory=str(CHROMA_DB_DIR),
+                )
+            else:
+                self.vector_store.add_documents(batch)
+            # 마지막 배치 이후엔 대기 불필요
+            if i + BATCH < len(splits):
+                time.sleep(15)   # 분당 요청 분산 (임베딩 rate limit 방지)
+
         logger.info("벡터 DB 구축 완료.")
 
     # ──────────────────────────────────────────────────────────
@@ -536,13 +593,16 @@ def extract_task_name(filename: str) -> Optional[str]:
 if __name__ == "__main__":
     force_rebuild = "--rebuild-db" in sys.argv
     # --model 인자로 시작 모델 지정 가능
-    # 예: python rag_analyzer.py --model gemini-2.0-flash
+    # 예: python rag_analyzer.py --model groq:llama-3.3-70b-versatile
     start_model = _pick_model_from_args()
+    # --embedding local 인자로 로컬 임베딩 사용
+    # 예: python rag_analyzer.py --rebuild-db --embedding local
+    embed_provider = _pick_embedding_from_args()
 
     if not OUTPUT_DIR.exists():
         OUTPUT_DIR.mkdir(parents=True)
 
-    rag = RAGSystem(model=start_model)
+    rag = RAGSystem(model=start_model, embedding=embed_provider)
     rag.build_vector_db(force_rebuild=force_rebuild)
 
     if not EXTRACTED_DIR.exists():

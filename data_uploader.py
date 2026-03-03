@@ -115,12 +115,12 @@ def _log_failure(record: dict[str, Any], reason: str) -> None:
 
 def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     """
-    core_regulations / action_triggers / reference_documents 가
-    문자열로 들어온 경우 리스트로 변환.
+    core_regulations / action_triggers / reference_documents /
+    compliance_checklists 가 문자열로 들어온 경우 리스트로 변환.
     lessons_learned 가 리스트인 경우 줄바꿈 문자열로 병합.
-    document_count 가 없으면 0 으로 기본값 설정.
     """
-    for key in ("core_regulations", "action_triggers", "reference_documents"):
+    for key in ("core_regulations", "action_triggers", "reference_documents",
+                "compliance_checklists"):
         val = record.get(key)
         if isinstance(val, str):
             record[key] = [v.strip() for v in val.split(",") if v.strip()]
@@ -131,8 +131,9 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     if isinstance(ll, list):
         record["lessons_learned"] = "\n".join(ll)
 
-    # 신규 텍스트 필드 기본값
-    for key in ("compliance_check", "recurrence_pattern", "semester"):
+    # 텍스트 필드 기본값
+    for key in ("compliance_check", "recurrence_pattern", "semester",
+                "standard_timeline", "early_warning", "auto_draft_context"):
         if record.get(key) is None:
             record[key] = ""
 
@@ -157,6 +158,13 @@ _NEW_COLUMNS = {
     "reference_documents", "compliance_check",
     "recurrence_pattern", "document_count", "semester",
 }
+# v3에서 추가된 컬럼 (SOP 생성기)
+_V3_COLUMNS = {
+    "standard_timeline",     # TEXT  — 행정편람 기준 상대적 처리 시점
+    "compliance_checklists", # JSONB — 기안 전 체크리스트 배열
+    "early_warning",         # TEXT  — 🚨 긴급 주의보 단문
+    "auto_draft_context",    # TEXT  — 기안문 초안 뼈대
+}
 
 def _try_migrate(supabase_url: str, supabase_key: str) -> bool:
     """
@@ -165,11 +173,15 @@ def _try_migrate(supabase_url: str, supabase_key: str) -> bool:
     """
     ddl = """
     ALTER TABLE gyomu_tasks
-      ADD COLUMN IF NOT EXISTS reference_documents JSONB    DEFAULT '[]',
-      ADD COLUMN IF NOT EXISTS compliance_check    TEXT     DEFAULT '',
-      ADD COLUMN IF NOT EXISTS recurrence_pattern  TEXT     DEFAULT '',
-      ADD COLUMN IF NOT EXISTS document_count      INTEGER  DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS semester            TEXT     DEFAULT '';
+      ADD COLUMN IF NOT EXISTS reference_documents    JSONB    DEFAULT '[]',
+      ADD COLUMN IF NOT EXISTS compliance_check       TEXT     DEFAULT '',
+      ADD COLUMN IF NOT EXISTS recurrence_pattern     TEXT     DEFAULT '',
+      ADD COLUMN IF NOT EXISTS document_count         INTEGER  DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS semester               TEXT     DEFAULT '',
+      ADD COLUMN IF NOT EXISTS standard_timeline      TEXT     DEFAULT '',
+      ADD COLUMN IF NOT EXISTS compliance_checklists  JSONB    DEFAULT '[]',
+      ADD COLUMN IF NOT EXISTS early_warning          TEXT     DEFAULT '',
+      ADD COLUMN IF NOT EXISTS auto_draft_context     TEXT     DEFAULT '';
     """
     # Supabase Management SQL API (서비스 롤 키 또는 PAT 필요)
     headers = {
@@ -212,7 +224,7 @@ def _detect_existing_columns(client: Any) -> set[str]:
         if resp.data:
             return set(resp.data[0].keys())
         # 데이터가 없으면 원래 + 신규 모두 시도 가능하다고 가정
-        return _ORIGINAL_COLUMNS | _NEW_COLUMNS
+        return _ORIGINAL_COLUMNS | _NEW_COLUMNS | _V3_COLUMNS
     except Exception:
         return _ORIGINAL_COLUMNS
 
@@ -246,8 +258,8 @@ class SupabaseUploader:
 
         # 실제 테이블 컬럼 감지
         self._existing_cols = _detect_existing_columns(self.client)
-        new_found = _NEW_COLUMNS & self._existing_cols
-        new_missing = _NEW_COLUMNS - self._existing_cols
+        new_found = (_NEW_COLUMNS | _V3_COLUMNS) & self._existing_cols
+        new_missing = (_NEW_COLUMNS | _V3_COLUMNS) - self._existing_cols
         if new_found:
             logger.info("[Supabase] v2 컬럼 확인됨: %s", ", ".join(sorted(new_found)))
         if new_missing:
@@ -260,7 +272,7 @@ class SupabaseUploader:
 
     def _build_payload(self, record: dict[str, Any], source_file: str) -> dict[str, Any]:
         """실제 테이블에 존재하는 컬럼만 포함한 페이로드를 생성합니다."""
-        allowed = _ORIGINAL_COLUMNS | (self._existing_cols & _NEW_COLUMNS)
+        allowed = _ORIGINAL_COLUMNS | (self._existing_cols & (_NEW_COLUMNS | _V3_COLUMNS))
         payload = {k: v for k, v in record.items() if k in allowed}
         payload["source_file"] = source_file
         return payload
